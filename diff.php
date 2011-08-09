@@ -1,8 +1,8 @@
 #!/usr/bin/php
 <?php
-$base           = '/Users/rgranadino/Downloads/'; 
-$upgradePath    = $base .'1.10.1.0';
-$oldPath        = $base. '1.10.0.1';
+$base           = '/Users/rgranadino/Documents/Projects/enterpise_magento/'; 
+$upgradePath    = $base .'1.11.0.0';
+$oldPath        = $base. '1.10.1.0';
 $storePath      = '/Users/rgranadino/Documents/Projects/MyProject/';
 
 
@@ -86,6 +86,44 @@ class mageUpgrade {
         return self::$instance;
     }
     /**
+     * check whether a file that has changed can be ignored
+     * This is used to ignore files in which only comments have changed
+     * which may not require to be reviewed
+     * @param str $fileA
+     * @param str $fileB
+     */
+    protected function _canIgnoreFileDiffs($fileA, $fileB)
+    {
+        $fileA   = escapeshellarg($fileA);
+        $fileB   = escapeshellarg($fileB);
+        $cmd     = "diff -y --suppress-common-lines {$fileA} {$fileB}";
+        $output  = array();
+        exec($cmd, $output);
+        $ignore  = array(
+        '#\s\* Magento\s+|\w+\* Magento Enterprise Edition#',//find Mage EE comment diff
+        '#\s\* This source file is subject to the Open Software License \( |\s+\* This source file is subject to the Magento Enterprise Edit#',
+        '#\s\* that is bundled with this package in the file LICENSE.txt. |\s+\* that is bundled with this package in the file LICENSE_EE.t#',
+        '#\s\* http://opensource.org/licenses/osl-3.0.php\s+|\s+\* http://www.magentocommerce.com/license/enterprise-edition#',
+        '#\s\* @package\s+ _home\s+ |\s+\* @package     _storage"#',
+        '#\s\* @copyright \s+Copyright \(c\) 2010 Magento Inc. \(http://www.m |	 \* @copyright   Copyright \(c\) 2011 Magento Inc. \(http://www.m#',
+        '#\s\* @license     http://opensource.org/licenses/osl-3.0.php  O |	 \* @license     http://www.magentocommerce.com/license/enterp#'
+        );
+        $numDiff = count($output);
+        $ignored = 0;
+        foreach ($output as $line) {
+            foreach ($ignore as $re) {
+                if (preg_match($re, $line)) {
+                    $ignored++;
+                    break;
+                }
+            }
+        }
+        if ($numDiff == $ignored) {
+            return true;
+        }
+        return false;
+    }
+    /**
      * compare two magento directories
      * @param str $v1
      * @param str $v2
@@ -99,19 +137,29 @@ class mageUpgrade {
             $data   = file_get_contents($cacheName);
             $output = unserialize($data);
         }
+        
         if (empty($output)) {
-            $cmd        = "diff -rq {$v1} {$v2}";
+            if (!is_readable($v1)) {
+                throw new Exception('Unable to read directory: '.$v1);
+            }
+            if (!is_readable($v2)) {
+                throw new Exception('Unable to read directory: '.$v2);
+            }
+            $cmd        = 'diff -rq '.escapeshellarg($v1).' '.escapeshellarg($v2);
             echo "Running Command: `{$cmd}`....\n";
             exec($cmd, $output);
             file_put_contents($cacheName, serialize($output));
         }
+        echo "\ngot this many lines...".count($output)."\n";
         foreach ($output as $line) {
             $diffPattern    = '#^Files (.*) and (.*) differ$#';
             if (preg_match($diffPattern, $line, $matches)) {
                 //FILE UPDATED
                 $relPath    = str_replace($v1, '', trim($matches[1]));
-                $this->addFile(mageUpgrade::FILE_UPDATED, $relPath);
-                $updates['updated'][] = $relPath;
+                //only add those files with non-trivial changes
+                if ($this->_canIgnoreFileDiffs($matches[1], $matches[2]) == false) {
+                    $this->addFile(mageUpgrade::FILE_UPDATED, $relPath);
+                }
             } else if (strpos($line, "Only in {$v1}") !== false) {
                 $relPath    = str_replace( "Only in {$v1}", '', $line);
                 $this->addFile(mageUpgrade::FILE_DELETED, $relPath);
@@ -188,17 +236,39 @@ class mageUpgrade {
             }
         }
     }
+    /**
+     * echo command to review files
+     * $localPath can be a string or an array
+     * 
+     * @param mixed $localPath local path of file
+     * @param str $relPath relative path to magento base dir
+     * @param str $type how was the file updated? (updated, new, deleted)
+     * @param bool $includeLocalDiff whether or not to add a third file parameter to vimdiff
+     */
     protected function _sayReview($localPath, $relPath, $type, $includeLocalDiff = true)
     {
-        echo "Needs Review: {$localPath} [$type]\n";
+        if (is_array($localPath)) {
+            $localPathStr = " Multiple Files: \n  ".implode("\n  ", $localPath);
+        } else {
+            $localPathStr = $localPath;
+        }
+        echo "Needs Review: [$type] {$localPathStr} \n";
         if ($type == self::FILE_UPDATED) {
             $oldPath    = realpath($this->oldPath.'/'.$relPath);
             $newPath    = realpath($this->newPath.'/'.$relPath);
             $cmd        = "\t vimdiff -O {$oldPath} {$newPath}";
             if ($includeLocalDiff) {
-                $cmd .= " {$localPath}";
+                if (is_array($localPath)) {
+                    foreach ($localPath as $path) {
+                        echo "{$cmd} {$path} \n\n";
+                    }
+                } else {
+                    $cmd .= " {$localPath}";
+                    echo $cmd . "\n\n";
+                }
+            } else {
+                echo $cmd ."\n\n";
             }
-            echo $cmd . "\n\n";
         }
         echo "\n";
     }
@@ -235,7 +305,14 @@ class mageUpgrade {
                                 $corePath = $coreBase.str_replace('_', '/', $text).'.php';
                                 $wasUpdated = $this->wasFileUpdated($corePath);
                                 if ($wasUpdated) {
-                                    $coreFiles[$file] = array('local'=> $file, 'core'=> $corePath, 'what'=> $wasUpdated) ;
+                                    if (!isset($coreFiles[$corePath])) {
+                                        $coreFiles[$corePath] = array(
+                                        	'core'  => $corePath,
+                                        	'what'  => $wasUpdated,
+                                            'files' => array()
+                                        );
+                                    }
+                                    $coreFiles[$corePath]['files'][] = $file;
                                 }
                             }
                             $saveNextString = false;
@@ -247,7 +324,7 @@ class mageUpgrade {
             }
         }
         foreach ($coreFiles as $info) {
-            $this->_sayReview($info['local'], $info['core'], $info['what'], false);
+            $this->_sayReview($info['files'], $info['core'], $info['what'], false);
         }
     }
     /**
